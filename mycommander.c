@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stdio.h>
-#include <signal.h>
 
 #define MAX_FILES 4096
 #define PATH_MAX_LEN 4096
@@ -36,9 +35,6 @@ typedef struct {
     char cwd[PATH_MAX_LEN];
 } Panel;
 
-volatile sig_atomic_t resized = 0;
-void handle_winch(int sig) { resized = 1; }
-
 FileType detect_file_type(const char *path, struct stat *st) {
     if (S_ISDIR(st->st_mode)) return TYPE_FOLDER;
     if (st->st_mode & S_IXUSR) return TYPE_EXEC;
@@ -66,6 +62,7 @@ void list_dir(Panel *panel) {
     panel->count = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL && panel->count < MAX_FILES) {
+        if (strcmp(entry->d_name, ".") == 0) continue;  // skip "."
         panel->entries[panel->count].name = strdup(entry->d_name);
         char full[PATH_MAX_LEN];
         snprintf(full, PATH_MAX_LEN, "%s/%s", panel->cwd, entry->d_name);
@@ -112,29 +109,32 @@ void draw_panel(WINDOW *win, Panel *panel, int active) {
     wrefresh(win);
 }
 
-void draw_terminal(WINDOW *win, char *input) {
+void draw_terminal(WINDOW *win, char *input, const char *status, int rename_mode, char *rename_buf) {
     werase(win); box(win,0,0);
-    int h,w; getmaxyx(win,h,w);
-    mvwprintw(win,0,2,"[ Terminal Input ]");
-    mvwprintw(win,1,1,"> %s",input);
+    mvwprintw(win,0,2,"[ Terminal | F1: Copy | F2: Paste | F3: Rename | F5: Delete | q: Quit ]");
+    if (rename_mode)
+        mvwprintw(win,1,1,"Rename to: %s", rename_buf);
+    else
+        mvwprintw(win,1,1,"> %s", input);
+    if (status) mvwprintw(win,2,1,"%s", status);
     wrefresh(win);
 }
 
 void open_entry(Panel *p) {
     char *sel = p->entries[p->selected].name;
-    if (!strcmp(sel,".")) return;
     if (!strcmp(sel,"..")) chdir("..");
     else {
         Entry *e = &p->entries[p->selected];
         if (e->type == TYPE_FOLDER) {
             chdir(sel);
         } else if (e->type == TYPE_TEXT) {
+            def_prog_mode();
             endwin();
-            char cmd[PATH_MAX_LEN + 32];
+            char cmd[PATH_MAX_LEN + 64];
             snprintf(cmd, sizeof(cmd), "nano \"%s\"", sel);
             system(cmd);
-            initscr(); noecho(); curs_set(0); keypad(stdscr,1);
-            resized = 1;
+            reset_prog_mode();
+            refresh();
         } else {
             if (fork() == 0) {
                 char cmd[PATH_MAX_LEN + 64];
@@ -148,9 +148,13 @@ void open_entry(Panel *p) {
     p->selected = p->scroll_offset = 0;
 }
 
-int main() {
-    signal(SIGWINCH, handle_winch);
+void sleep_ms(int ms) {
+    timeout(ms);
+    getch();
+    timeout(1000);
+}
 
+int main() {
     Panel l,r; getcwd(l.cwd,PATH_MAX_LEN); strcpy(r.cwd,"/");
     list_dir(&l); list_dir(&r);
 
@@ -168,14 +172,22 @@ int main() {
     enum {FOCUS_L, FOCUS_R} focus = FOCUS_L;
 
     char input[512]={0}; int ilen=0;
+    char clipboard[PATH_MAX_LEN] = "";
+    char status[256] = "";
+    int rename_mode = 0;
+    char rename_buf[PATH_MAX_LEN] = "";
+
+    nodelay(stdscr, TRUE);
+    timeout(1000);
+
+    int last_w = w, last_h = h;
 
     draw_panel(lw,&l,focus==FOCUS_L);
     draw_panel(rw,&r,focus==FOCUS_R);
-    draw_terminal(tw,input);
+    draw_terminal(tw,input,status,rename_mode,rename_buf);
 
     while(1) {
         getmaxyx(stdscr,h,w);
-
         if (w < MIN_WIDTH || h < MIN_HEIGHT) {
             clear();
             const char *msg = "Window too small! Resize to continue.";
@@ -186,49 +198,7 @@ int main() {
             continue;
         }
 
-        int ch = getch();
-        if (ch == 'q') break;
-
-        if (ch == '\t') {
-            focus = (focus == FOCUS_L) ? FOCUS_R : FOCUS_L;
-        }
-        else if (ch == KEY_UP || ch == KEY_DOWN) {
-            if (focus == FOCUS_L) {
-                if (ch == KEY_UP && l.selected > 0) l.selected--;
-                if (ch == KEY_DOWN && l.selected < l.count - 1) l.selected++;
-            } else {
-                if (ch == KEY_UP && r.selected > 0) r.selected--;
-                if (ch == KEY_DOWN && r.selected < r.count - 1) r.selected++;
-            }
-        }
-        else if (ch == '\n') {
-            if (ilen > 0) {
-                endwin();
-                Panel *p = (focus == FOCUS_L) ? &l : &r;
-                chdir(p->cwd);
-                char cmd[1024];
-                snprintf(cmd, sizeof(cmd), "bash -c '%s'", input);
-                system(cmd);
-                initscr(); noecho(); curs_set(0); keypad(stdscr,1);
-                resized = 1; ilen = 0; input[0] = '\0';
-            } else {
-                if (focus == FOCUS_L) open_entry(&l);
-                else open_entry(&r);
-            }
-        }
-        else if (ch != ERR) {
-            if (ch == 127 || ch == KEY_BACKSPACE) {
-                if (ilen > 0) input[--ilen] = '\0';
-            } else if (ch < 256 && ilen < sizeof(input)-1) {
-                input[ilen++] = ch; input[ilen] = '\0';
-            }
-        }
-
-        if (resized) {
-            endwin(); refresh(); clear();
-            getmaxyx(stdscr,h,w);
-            if (w < MIN_WIDTH || h < MIN_HEIGHT) continue;
-
+        if (h != last_h || w != last_w) {
             ph = h - terminal_height;
             th = terminal_height;
 
@@ -239,21 +209,105 @@ int main() {
             mvwin(rw, 0, w/2);
             mvwin(tw, ph, 0);
 
-            free_panel(&l); free_panel(&r);
-            list_dir(&l); list_dir(&r);
+            last_w = w; last_h = h;
+        }
 
-            touchwin(stdscr); redrawwin(stdscr);
-            touchwin(lw); wnoutrefresh(lw);
-            touchwin(rw); wnoutrefresh(rw);
-            touchwin(tw); wnoutrefresh(tw);
-            doupdate();
+        int ch = getch();
+        if (ch == 'q') break;
 
-            resized = 0;
+        if (rename_mode) {
+            if (ch == '\n') {
+                Panel *p = (focus == FOCUS_L) ? &l : &r;
+                char oldpath[PATH_MAX_LEN], newpath[PATH_MAX_LEN];
+                snprintf(oldpath, sizeof(oldpath), "%s/%s", p->cwd, p->entries[p->selected].name);
+                snprintf(newpath, sizeof(newpath), "%s/%s", p->cwd, rename_buf);
+                rename(oldpath, newpath);
+                free_panel(p); list_dir(p);
+                rename_mode = 0;
+                rename_buf[0] = '\0';
+            } else if (ch == KEY_F(3)) {
+                rename_mode = 0;
+                rename_buf[0] = '\0';
+            } else if (ch == 127 || ch == KEY_BACKSPACE) {
+                int l = strlen(rename_buf);
+                if (l > 0) rename_buf[l-1] = '\0';
+            } else if (ch < 256 && strlen(rename_buf) < PATH_MAX_LEN-1) {
+                int l = strlen(rename_buf);
+                rename_buf[l] = ch; rename_buf[l+1] = '\0';
+            }
+        } else if (ch == '\t') {
+            focus = (focus == FOCUS_L) ? FOCUS_R : FOCUS_L;
+        }
+        else if (ch == KEY_UP || ch == KEY_DOWN) {
+            Panel *p = (focus == FOCUS_L) ? &l : &r;
+            if (ch == KEY_UP && p->selected > 0) p->selected--;
+            if (ch == KEY_DOWN && p->selected < p->count - 1) p->selected++;
+        }
+        else if (ch == '\n') {
+            if (ilen > 0) {
+                def_prog_mode(); endwin();
+                Panel *p = (focus == FOCUS_L) ? &l : &r;
+                chdir(p->cwd);
+                char cmd[1024];
+                snprintf(cmd, sizeof(cmd), "bash -c '%s'", input);
+                system(cmd);
+                reset_prog_mode(); refresh();
+                ilen = 0; input[0] = '\0';
+            } else {
+                Panel *p = (focus == FOCUS_L) ? &l : &r;
+                open_entry(p);
+            }
+        }
+        else if (ch == KEY_F(1)) {
+            Panel *p = (focus == FOCUS_L) ? &l : &r;
+            snprintf(clipboard, sizeof(clipboard), "%s/%s", p->cwd, p->entries[p->selected].name);
+            snprintf(status, sizeof(status), "Copied %s", p->entries[p->selected].name);
+            sleep_ms(1000); status[0] = '\0';
+        }
+        else if (ch == KEY_F(2) && clipboard[0]) {
+            Panel *p = (focus == FOCUS_L) ? &l : &r;
+            chdir(p->cwd);
+            char *base = strrchr(clipboard, '/');
+            if (!base) base = clipboard; else base++;
+            char target[PATH_MAX_LEN];
+            snprintf(target, sizeof(target), "%s", base);
+            int i = 1;
+            while (access(target, F_OK) == 0) {
+                snprintf(target, sizeof(target), "%s%d", base, i++);
+            }
+            char cmd[PATH_MAX_LEN * 2 + 32];
+            snprintf(cmd, sizeof(cmd), "cp -r \"%s\" \"%s\"", clipboard, target);
+            def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
+            free_panel(p); list_dir(p);
+            snprintf(status, sizeof(status), "Pasted %s", target);
+            sleep_ms(1000); status[0] = '\0';
+        }
+        else if (ch == KEY_F(3)) {
+            rename_mode = !rename_mode;
+            rename_buf[0] = '\0';
+        }
+        else if (ch == KEY_F(5)) {
+            Panel *p = (focus == FOCUS_L) ? &l : &r;
+            char path[PATH_MAX_LEN];
+            snprintf(path, sizeof(path), "%s/%s", p->cwd, p->entries[p->selected].name);
+            char cmd[PATH_MAX_LEN + 16];
+            snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", path);
+            def_prog_mode(); endwin(); system(cmd); reset_prog_mode(); refresh();
+            free_panel(p); list_dir(p);
+            snprintf(status, sizeof(status), "Deleted %s", p->entries[p->selected].name);
+            sleep_ms(1000); status[0] = '\0';
+        }
+        else if (ch != ERR) {
+            if (ch == 127 || ch == KEY_BACKSPACE) {
+                if (ilen > 0) input[--ilen] = '\0';
+            } else if (ch < 256 && ilen < sizeof(input)-1) {
+                input[ilen++] = ch; input[ilen] = '\0';
+            }
         }
 
         draw_panel(lw,&l,focus==FOCUS_L);
         draw_panel(rw,&r,focus==FOCUS_R);
-        draw_terminal(tw,input);
+        draw_terminal(tw,input,status,rename_mode,rename_buf);
     }
     endwin();
     return 0;
